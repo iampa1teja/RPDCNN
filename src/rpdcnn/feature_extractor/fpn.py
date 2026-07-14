@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn 
 from torchvision.ops import FeaturePyramidNetwork 
 from torchvision.ops.feature_pyramid_network import LastLevelP6P7
-from typing import List, OrderedDict
+from collections import OrderedDict
+from typing import List
 
 class FPN(nn.Module):
     """

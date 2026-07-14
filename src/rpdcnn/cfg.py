@@ -7,6 +7,7 @@ class RPDCFG:
     num_classes: int = 80 
     in_strides: List[int] = field(default_factory=lambda:[4, 8, 16, 32])
     freeze_backbone: bool = False 
+    freeze_backbone_bn: bool = False
     freeze_backbone_backbone_bn: bool = False
     backbone_freeze_stages: int = -1 
 
@@ -25,6 +26,9 @@ class RPDCFG:
 
     use_cbam: bool = True 
     cbam_reduction: int = 16 
+
+    det_num_convs: int = 4
+    det_norm_groups: int = 8
 
     mask_branch_in_features: List[str] = field(default_factory=lambda: ["p3", "p4", "p5"])
     mask_branch_channels: int = 128

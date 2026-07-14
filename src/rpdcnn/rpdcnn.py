@@ -6,14 +6,13 @@ import os
 import glob
 import time 
 from tqdm import tqdm 
+import json 
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
 from torch.utils.data import DataLoader
-
-
 
 from .cfg import RPDCFG
 from .feature_extractor.backbone import Backbone
@@ -28,6 +27,11 @@ from .utils.losses import IOULoss, compute_fcos_losses
 from .utils.viz_utils import save_epoch_visualization
 from .utils.yolo_poly_dataset import YoloPolyDataset
 from .utils.yolo_poly_dataset import yolo_poly_collate_fn
+from .utils.viz_utils import get_class_color, _draw_class_legend
+
+
+
+
 
 
 def _level_name(stride: int) -> str:
@@ -809,3 +813,174 @@ class RPDCNN(nn.Module):
                 print(f"[RPDCNN] saved checkpoint -> {ckpt_path}")
 
         print("[RPDCNN] training complete.")
+
+    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+    def _load_and_preprocess(self, img_path, img_h, img_w):
+        image = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise IOError(f"Failed to read image: {img_path}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image.shape[:2]
+        resized = cv2.resize(image, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+        tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+        return tensor, orig_h, orig_w
+
+
+    def _draw_polygons_on_image(self, image, instances, alpha=0.45):
+        """
+        image: (H, W, 3) uint8 RGB at ORIGINAL resolution.
+        instances: list of dict(class_id, score, polygon) with polygon (K,2)
+            normalized [0,1] (x, y).
+        """
+        out = image.copy()
+        h, w = image.shape[:2]
+        class_ids = [inst["class_id"] for inst in instances]
+
+        for inst in instances:
+            pts = inst["polygon"].copy()
+            pts[:, 0] *= w
+            pts[:, 1] *= h
+            pts_i = pts.round().astype(np.int32).reshape(-1, 1, 2)
+
+            color = get_class_color(inst["class_id"])
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [pts_i], 1)
+            overlay = out.copy()
+            overlay[mask.astype(bool)] = color
+            out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+            cv2.polylines(out, [pts_i], isClosed=True, color=color, thickness=2)
+
+            label = f"{inst['class_id']}:{inst['score']:.2f}"
+            x0, y0 = pts_i[:, 0, 0].min(), pts_i[:, 0, 1].min()
+            cv2.putText(out, label, (int(x0), max(int(y0) - 5, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        if class_ids:
+            out = _draw_class_legend(out, class_ids)
+        return out
+
+
+    @torch.no_grad()
+    def predict(
+        self,
+        model,
+        image_path: str,
+        score_thresh: float = 0.3,
+        nms_iou_threshold: float = 0.5,
+        mask_threshold: float = 0.5,
+        approx_epsilon_frac: float = 0.005,
+        device=None,
+    ):
+        """
+        Runs RPDCNN on a single image.
+
+        Returns:
+            result: JSON-serializable dict —
+                {"image_path", "width", "height",
+                "instances": [{"class_id", "score", "polygon": [[x,y],...]}]}
+                polygon coords are ABSOLUTE pixels at the image's ORIGINAL resolution.
+            viz: (H, W, 3) uint8 RGB numpy array (original resolution) with
+                overlaid masks/outlines/labels.
+        """
+        device = device or next(model.parameters()).device
+        was_training = model.training
+        model.eval()
+
+        tensor, orig_h, orig_w = self._load_and_preprocess(image_path, model.img_h, model.img_w)
+        images = tensor.unsqueeze(0).to(device)
+
+        out = model(
+            images,
+            score_thresh=score_thresh,
+            nms_iou_threshold=nms_iou_threshold,
+            mask_threshold=mask_threshold,
+            approx_epsilon_frac=approx_epsilon_frac,
+        )
+        preds = out["polygons"][0] if len(out["polygons"]) > 0 else []
+
+        instances, norm_instances = [], []
+        for p in preds:
+            poly_abs = p["polygon"].copy()
+            poly_abs[:, 0] *= orig_w
+            poly_abs[:, 1] *= orig_h
+            instances.append({
+                "class_id": int(p["class_id"]),
+                "score": float(p["score"]),
+                "polygon": poly_abs.round(2).tolist(),
+            })
+            norm_instances.append({"class_id": int(p["class_id"]), "score": float(p["score"]), "polygon": p["polygon"]})
+
+        result = {"image_path": image_path, "width": orig_w, "height": orig_h, "instances": instances}
+
+        orig_img = cv2.cvtColor(cv2.imread(image_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        viz = self.draw_polygons_on_image(orig_img, norm_instances)
+
+        if was_training:
+            model.train()
+        return result, viz
+
+
+    def infer(
+        self,
+        model,
+        img: str = None,
+        img_dir: str = None,
+        output_dir: str = "./rpdcnn_infer_output",
+        score_thresh: float = 0.3,
+        nms_iou_threshold: float = 0.5,
+        mask_threshold: float = 0.5,
+        approx_epsilon_frac: float = 0.005,
+        device=None,
+    ):
+        """
+        Provide EITHER `img` (single path) OR `img_dir` (folder). If both are
+        given, `img` takes priority. Saves per image:
+            output_dir/json/<stem>.json
+            output_dir/viz/<stem>.png
+        Returns: list of result dicts.
+        """
+        if img is None and img_dir is None:
+            raise ValueError("Provide either `img` or `img_dir`.")
+
+        if img is not None:
+            image_paths = [img]
+        else:
+            image_paths = sorted([
+                p for p in glob.glob(os.path.join(img_dir, "*"))
+                if os.path.splitext(p)[1].lower() in IMG_EXTS
+            ])
+            if len(image_paths) == 0:
+                raise FileNotFoundError(f"No images found in {img_dir}")
+
+        json_dir = os.path.join(output_dir, "json")
+        viz_dir = os.path.join(output_dir, "viz")
+        os.makedirs(json_dir, exist_ok=True)
+        os.makedirs(viz_dir, exist_ok=True)
+
+        all_results = []
+        for path in image_paths:
+            result, viz = self.predict(
+                model, path,
+                score_thresh=score_thresh,
+                nms_iou_threshold=nms_iou_threshold,
+                mask_threshold=mask_threshold,
+                approx_epsilon_frac=approx_epsilon_frac,
+                device=device,
+            )
+            stem = os.path.splitext(os.path.basename(path))[0]
+
+            json_path = os.path.join(json_dir, f"{stem}.json")
+            with open(json_path, "w") as f:
+                json.dump(result, f, indent=2)
+
+            viz_path = os.path.join(viz_dir, f"{stem}.png")
+            cv2.imwrite(viz_path, cv2.cvtColor(viz, cv2.COLOR_RGB2BGR))
+
+            result["json_path"], result["viz_path"] = json_path, viz_path
+            all_results.append(result)
+            print(f"[RPDCNN] {stem}: {len(result['instances'])} instances -> {json_path}, {viz_path}")
+
+        print(f"[RPDCNN] done. {len(all_results)} image(s) -> {output_dir}")
+        return all_results

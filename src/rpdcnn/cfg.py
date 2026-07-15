@@ -53,6 +53,19 @@ class RPDCFG:
     loss_focal_gamma: float = 2.0
     loss_iou_type: str = "giou"
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "RPDCFG":
+        if isinstance(data, cls):
+            return data
+        valid_fields = {field.name for field in dataclasses.fields(cls)}
+        unknown_keys = set(data) - valid_fields
+        if unknown_keys:
+            raise ValueError(f"Unknown RPDCFG field(s): {unknown_keys}")
+        return cls(**data)
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
 
 _NANO_PRESET = dict(
     backbone_name="mobilenetv3_large_100",

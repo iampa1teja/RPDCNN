@@ -675,7 +675,7 @@ class RPDCNN(nn.Module):
             "epoch": epoch,
             "model_state_dict": self.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "cfg": self.cfg,
+            "cfg": self.cfg.to_dict() if hasattr(self.cfg, "to_dict") else self.cfg,
         }, ckpt_path)
         return ckpt_path
 
@@ -688,6 +688,11 @@ class RPDCNN(nn.Module):
 
     def _load_checkpoint(self, ckpt_path: str, optimizer: Optional[torch.optim.Optimizer] = None) -> int:
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        cfg = ckpt.get("cfg")
+        if isinstance(cfg, dict):
+            ckpt["cfg"] = RPDCFG.from_dict(cfg)
+        elif cfg is not None and not isinstance(cfg, RPDCFG):
+            ckpt["cfg"] = cfg
         self.load_state_dict(ckpt["model_state_dict"])
         if optimizer is not None and "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -865,7 +870,6 @@ class RPDCNN(nn.Module):
     @torch.no_grad()
     def predict(
         self,
-        model,
         image_path: str,
         score_thresh: float = 0.3,
         nms_iou_threshold: float = 0.5,
@@ -884,14 +888,14 @@ class RPDCNN(nn.Module):
             viz: (H, W, 3) uint8 RGB numpy array (original resolution) with
                 overlaid masks/outlines/labels.
         """
-        device = device or next(model.parameters()).device
-        was_training = model.training
-        model.eval()
+        device = device or next(self.parameters()).device
+        was_training = self.training
+        self.eval()
 
-        tensor, orig_h, orig_w = self._load_and_preprocess(image_path, model.img_h, model.img_w)
+        tensor, orig_h, orig_w = self._load_and_preprocess(image_path, self.img_h, self.img_w)
         images = tensor.unsqueeze(0).to(device)
 
-        out = model(
+        out = self(
             images,
             score_thresh=score_thresh,
             nms_iou_threshold=nms_iou_threshold,
@@ -915,10 +919,10 @@ class RPDCNN(nn.Module):
         result = {"image_path": image_path, "width": orig_w, "height": orig_h, "instances": instances}
 
         orig_img = cv2.cvtColor(cv2.imread(image_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-        viz = self.draw_polygons_on_image(orig_img, norm_instances)
+        viz = self._draw_polygons_on_image(orig_img, norm_instances)
 
         if was_training:
-            model.train()
+            self.train()
         return result, viz
 
 
@@ -962,7 +966,7 @@ class RPDCNN(nn.Module):
         all_results = []
         for path in image_paths:
             result, viz = self.predict(
-                model, path,
+                path,
                 score_thresh=score_thresh,
                 nms_iou_threshold=nms_iou_threshold,
                 mask_threshold=mask_threshold,

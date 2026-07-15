@@ -27,6 +27,7 @@ It's built as an FCOS-style detector with a CondInst-style dynamic ("controller-
 - [Repository layout](#repository-layout)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
+- [Loading a model from a checkpoint](#4-load-a-trained-model-from-a-checkpoint)
 - [Label format](#label-format-yolo-seg)
 - [Configuration](#configuration)
 - [Component reference](#component-reference)
@@ -265,11 +266,38 @@ print(result["instances"])   # [{"class_id":..., "score":..., "polygon":[[x,y],.
 
 `result["instances"][i]["polygon"]` is a list of **absolute pixel** `(x, y)` coordinates at the image's original resolution.
 
-### 4. Run inference over a folder and save JSON + overlays
+### 4. Load a trained model from a checkpoint
+
+Checkpoints saved by `train_model()` bundle `cfg` alongside the weights (see [Checkpointing & resuming](#checkpointing--resuming)), so a model can be rebuilt without redeclaring `RPDCFG` by hand. The saved `cfg` is a **plain dict** (`RPDCFG.to_dict()`), not an `RPDCFG` instance — it must be converted back with `RPDCFG.from_dict()` before it's passed into `RPDCNN(...)`, since the model reads config fields as attributes (`cfg.num_classes`, etc.), not dict keys.
+
+```python
+import torch
+from rpdcnn import RPDCNN
+from rpdcnn.cfg import RPDCFG
+
+ckpt_path = "last.pt"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+ckpt = torch.load(ckpt_path, map_location=device)
+
+cfg = ckpt["cfg"]
+if isinstance(cfg, dict):
+    cfg = RPDCFG.from_dict(cfg)   # checkpoint stores cfg as a plain dict — convert back
+
+model = RPDCNN(cfg)                              # rebuild architecture from saved cfg
+model.load_state_dict(ckpt["model_state_dict"])  # load trained weights
+model.to(device)
+model.eval()
+
+result, viz = model.predict(image_path="img.jpg")
+print(result)
+print(viz)
+```
+
+### 5. Run inference over a folder and save JSON + overlays
 
 ```python
 model.infer(
-    model,
     img_dir="data/test_images",
     output_dir="./rpdcnn_infer_output",
     score_thresh=0.3,
@@ -285,7 +313,7 @@ rpdcnn_infer_output/
 └── viz/<stem>.png     # original image with mask overlay + polygon outline + class legend
 ```
 
-### 5. Raw forward pass (custom decode pipeline)
+### 6. Raw forward pass (custom decode pipeline)
 
 ```python
 model.eval()
@@ -391,7 +419,7 @@ Returned as a dict from `forward()` in training mode and summed for backprop:
 
 ## Checkpointing & resuming
 
-`train_model()` saves to `output_dir/checkpoints/epoch_XXXX.pt`, containing `model_state_dict`, `optimizer_state_dict`, `epoch`, and `cfg`. Resuming is controlled entirely through the config:
+`train_model()` saves to `output_dir/checkpoints/epoch_XXXX.pt`, containing `model_state_dict`, `optimizer_state_dict`, `epoch`, and `cfg` (saved via `RPDCFG.to_dict()`, i.e. as a plain dict — see [Load a trained model from a checkpoint](#4-load-a-trained-model-from-a-checkpoint) for rebuilding a model from it). Resuming is controlled entirely through the config:
 
 ```python
 cfg.resume_training = True

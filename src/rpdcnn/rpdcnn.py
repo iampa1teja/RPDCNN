@@ -90,6 +90,7 @@ class RPDCNN(nn.Module):
         self.mask_out_stride = cfg.mask_head_out_stride
         self.img_h = cfg.img_h
         self.img_w = cfg.img_w
+        self.IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
         # ---------------- Backbone ----------------
         self.backbone = Backbone(
@@ -819,9 +820,6 @@ class RPDCNN(nn.Module):
 
         print("[RPDCNN] training complete.")
 
-    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
-
-
     def _load_and_preprocess(self, img_path, img_h, img_w):
         image = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if image is None:
@@ -928,7 +926,6 @@ class RPDCNN(nn.Module):
 
     def infer(
         self,
-        model,
         img: str = None,
         img_dir: str = None,
         output_dir: str = "./rpdcnn_infer_output",
@@ -953,7 +950,7 @@ class RPDCNN(nn.Module):
         else:
             image_paths = sorted([
                 p for p in glob.glob(os.path.join(img_dir, "*"))
-                if os.path.splitext(p)[1].lower() in IMG_EXTS
+                if os.path.splitext(p)[1].lower() in self.IMG_EXTS
             ])
             if len(image_paths) == 0:
                 raise FileNotFoundError(f"No images found in {img_dir}")

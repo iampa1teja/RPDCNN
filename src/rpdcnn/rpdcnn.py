@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 from .cfg import RPDCFG
 from .feature_extractor.backbone import Backbone
@@ -715,6 +715,8 @@ class RPDCNN(nn.Module):
         weight_decay: float = 1e-4,
         num_workers: int = 4,
         save_freq: int = 5,
+        train_split: float = 0.8,
+        split_seed: int = 42,
         class_names: Optional[List[str]] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
@@ -730,7 +732,8 @@ class RPDCNN(nn.Module):
             "class {id}" when omitted.
 
         Every epoch:
-            - runs one pass over the dataset, backprop on total loss
+            - runs one pass over the train split, backprop on total loss
+            - runs one pass over the val split (no grad)
             - saves a GT-vs-prediction visualization panel to output_dir/viz/
         Every `save_freq` epochs (and at the final epoch):
             - saves a checkpoint to output_dir/checkpoints/
@@ -743,14 +746,49 @@ class RPDCNN(nn.Module):
             raise NotImplementedError(
                 f"format='{format}' not supported yet. Only 'yolo_poly' is implemented."
             )
+        if not (0.0 < train_split < 1.0):
+            raise ValueError(f"train_split must be in (0, 1). Got {train_split}.")
 
         os.makedirs(output_dir, exist_ok=True)
         self.to(device)
 
         dataset = YoloPolyDataset(img_dir, label_dir, img_h=self.img_h, img_w=self.img_w)
-        loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, collate_fn=yolo_poly_collate_fn, drop_last=True,
+        dataset_len = len(dataset)
+        if dataset_len < 2:
+            raise ValueError(
+                "Need at least 2 samples to create default train/val split. "
+                f"Found {dataset_len}."
+            )
+
+        train_size = int(dataset_len * train_split)
+        train_size = max(1, min(train_size, dataset_len - 1))
+        val_size = dataset_len - train_size
+
+        split_generator = torch.Generator().manual_seed(split_seed)
+        train_dataset, val_dataset = random_split(
+            dataset, [train_size, val_size], generator=split_generator
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=yolo_poly_collate_fn,
+            drop_last=(len(train_dataset) >= batch_size),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=yolo_poly_collate_fn,
+            drop_last=False,
+        )
+
+        print(
+            f"[RPDCNN] dataset split -> train: {len(train_dataset)} samples, "
+            f"val: {len(val_dataset)} samples (train_split={train_split:.2f})"
         )
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
@@ -764,16 +802,17 @@ class RPDCNN(nn.Module):
             else:
                 print("[RPDCNN] resume_training=True but no checkpoint found — starting fresh.")
 
-        self.train()
         for epoch in range(start_epoch, num_epochs):
             epoch_start = time.time()
-            running_losses = {}
-            num_batches = 0
+            train_running_losses = {}
+            train_num_batches = 0
 
             last_batch_images = None
             last_batch_gt_bitmasks_full = None
+            last_batch_gt_labels = None
 
-            for batch in tqdm(loader):
+            self.train()
+            for batch in tqdm(train_loader):
                 images = batch["images"].to(device)
                 labels_batch = batch["labels_batch"]
                 polygons_batch = batch["polygons_batch"]
@@ -789,9 +828,9 @@ class RPDCNN(nn.Module):
                 optimizer.step()
 
                 for k, v in losses.items():
-                    running_losses[k] = running_losses.get(k, 0.0) + v.item()
-                running_losses["total"] = running_losses.get("total", 0.0) + total_loss.item()
-                num_batches += 1
+                    train_running_losses[k] = train_running_losses.get(k, 0.0) + v.item()
+                train_running_losses["total"] = train_running_losses.get("total", 0.0) + total_loss.item()
+                train_num_batches += 1
 
                 last_batch_images = images
                 # Reuse the same rasterizer as forward() for the viz panel,
@@ -800,10 +839,46 @@ class RPDCNN(nn.Module):
                     labels_batch, polygons_batch, images.shape[-2], images.shape[-1], device
                 )
 
-            avg_losses = {k: v / num_batches for k, v in running_losses.items()}
+            if train_num_batches == 0:
+                raise RuntimeError(
+                    "No train batches were produced. Reduce batch_size or check dataset split."
+                )
+            avg_train_losses = {k: v / train_num_batches for k, v in train_running_losses.items()}
+
+            val_running_losses = {}
+            val_num_batches = 0
+            self.eval()
+            with torch.no_grad():
+                for batch in val_loader:
+                    images = batch["images"].to(device)
+                    labels_batch = batch["labels_batch"]
+                    polygons_batch = batch["polygons_batch"]
+
+                    losses = self.forward(
+                        images,
+                        yolo_labels_batch=labels_batch,
+                        yolo_polygons_batch=polygons_batch,
+                    )
+                    total_loss = sum(losses.values())
+
+                    for k, v in losses.items():
+                        val_running_losses[k] = val_running_losses.get(k, 0.0) + v.item()
+                    val_running_losses["total"] = val_running_losses.get("total", 0.0) + total_loss.item()
+                    val_num_batches += 1
+
+            if val_num_batches == 0:
+                raise RuntimeError(
+                    "No val batches were produced. Check dataset size/split settings."
+                )
+            avg_val_losses = {k: v / val_num_batches for k, v in val_running_losses.items()}
+
             elapsed = time.time() - epoch_start
-            loss_str = " ".join(f"{k}={v:.4f}" for k, v in avg_losses.items())
-            print(f"[RPDCNN] epoch {epoch + 1}/{num_epochs} ({elapsed:.1f}s) {loss_str}")
+            train_loss_str = " ".join(f"{k}={v:.4f}" for k, v in avg_train_losses.items())
+            val_loss_str = " ".join(f"{k}={v:.4f}" for k, v in avg_val_losses.items())
+            print(
+                f"[RPDCNN] epoch {epoch + 1}/{num_epochs} ({elapsed:.1f}s) "
+                f"train[{train_loss_str}] val[{val_loss_str}]"
+            )
 
             if last_batch_images is not None:
                 viz_path = save_epoch_visualization(
